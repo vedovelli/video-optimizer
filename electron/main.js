@@ -17,7 +17,6 @@ const isDev = !app.isPackaged;
 
 const require = createRequire(import.meta.url);
 
-const TelegramBot = require("node-telegram-bot-api");
 const ffmpeg = require("fluent-ffmpeg");
 
 // Set ffmpeg and ffprobe paths
@@ -38,37 +37,6 @@ const ffprobePath = isDev
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
-// Telegram configuration
-const TELEGRAM_BOT_TOKEN = "7964160662:AAENt0vldjl4YR5Zs2QThB0WXABB9Qi63eU";
-const TELEGRAM_CHANNEL_ID = "-1002411767073";
-let telegramBot = null;
-
-app.whenReady().then(async () => {
-  try {
-    telegramBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
-    await telegramBot.getChat(TELEGRAM_CHANNEL_ID);
-  } catch (error) {
-    console.error("Failed to initialize Telegram");
-  }
-  createWindow();
-});
-
-async function sendToTelegram(filePath, caption) {
-  if (!telegramBot) {
-    throw new Error("Telegram not configured");
-  }
-
-  try {
-    const video = fs.createReadStream(filePath);
-    await telegramBot.sendVideo(TELEGRAM_CHANNEL_ID, video, {
-      caption: caption || "Video update",
-    });
-    return true;
-  } catch (error) {
-    throw error;
-  }
-}
-
 function createWindow() {
   const win = new BrowserWindow({
     width: 800,
@@ -87,6 +55,8 @@ function createWindow() {
     win.loadFile(path.join(__dirname, "../dist/index.html"));
   }
 }
+
+app.whenReady().then(createWindow);
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
@@ -110,54 +80,53 @@ async function cleanupFiles(inputPath, outputPath) {
   }
 }
 
-ipcMain.on(
-  "optimize-video",
-  (event, { inputPath, outputName, sendToTelegram: shouldSendToTelegram }) => {
-    ffmpeg.ffprobe(inputPath, (err, metadata) => {
-      if (err) {
-        event.reply("optimization-complete", {
-          success: false,
-          error: err.message,
-        });
-        return;
-      }
+ipcMain.on("optimize-video", async (event, payload) => {
+  // Accept both single file and array for backward compatibility
+  const files = Array.isArray(payload) ? payload.slice(0, 10) : [payload];
 
-      ffmpeg(inputPath)
-        .outputOptions(["-vcodec h264", "-acodec aac"])
-        .on("progress", (progress) => {
-          const percent = Math.round((progress.percent || 0) * 100) / 100;
-          event.reply("optimization-progress", { percent });
-        })
-        .on("end", async () => {
-          if (shouldSendToTelegram) {
-            try {
-              await sendToTelegram(outputName);
-              const cleaned = await cleanupFiles(inputPath, outputName);
-              event.reply("optimization-complete", {
-                success: true,
-                telegramSent: true,
-                filesDeleted: cleaned,
-              });
-            } catch (error) {
-              event.reply("optimization-complete", {
-                success: true,
-                telegramError: error.message,
-              });
-            }
-          } else {
-            event.reply("optimization-complete", { success: true });
+  for (let i = 0; i < files.length; i++) {
+    const { inputPath, outputName } = files[i];
+    try {
+      await new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(inputPath, (err, metadata) => {
+          if (err) {
+            event.reply("optimization-complete", {
+              success: false,
+              error: err.message,
+              index: i,
+            });
+            return reject(err);
           }
-        })
-        .on("error", (err) => {
-          event.reply("optimization-complete", {
-            success: false,
-            error: err.message,
-          });
-        })
-        .save(outputName);
-    });
+          ffmpeg(inputPath)
+            .outputOptions(["-vcodec h264", "-acodec aac"])
+            .on("progress", (progress) => {
+              const percent = Math.round((progress.percent || 0) * 100) / 100;
+              event.reply("optimization-progress", { percent, index: i });
+            })
+            .on("end", async () => {
+              event.reply("optimization-complete", {
+                success: true,
+                index: i,
+              });
+              resolve();
+            })
+            .on("error", (err) => {
+              event.reply("optimization-complete", {
+                success: false,
+                error: err.message,
+                index: i,
+              });
+              reject(err);
+            })
+            .save(outputName);
+        });
+      });
+    } catch (e) {
+      // Already handled in event.reply above
+      continue;
+    }
   }
-);
+});
 
 ipcMain.on("open-file", (event, filePath) => {
   shell.openPath(filePath);

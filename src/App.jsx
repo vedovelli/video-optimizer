@@ -1,173 +1,206 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+
+import fs from "fs";
+
 const { ipcRenderer } = window.require("electron");
 
+const MAX_FILES = 10;
+
 function App() {
-  const [file, setFile] = useState(null);
+  const [files, setFiles] = useState([]); // [{file, progress, status, optimizedPath, error}]
   const [processing, setProcessing] = useState(false);
-  const [optimizedFile, setOptimizedFile] = useState(null);
-  const [progress, setProgress] = useState(0);
-  const [sendToTelegram, setSendToTelegram] = useState(
-    localStorage.getItem("sendToTelegram") === "true"
-  );
+  const filesRef = useRef(files);
 
+  // Keep filesRef in sync with files state
   useEffect(() => {
-    localStorage.setItem("sendToTelegram", sendToTelegram);
-  }, [sendToTelegram]);
+    filesRef.current = files;
+  }, [files]);
 
-  useEffect(() => {
-    if (file) {
-      handleProcess();
-    }
-  }, [file]);
-
+  // Handle drag-and-drop for multiple files
   const handleDrop = (e) => {
     e.preventDefault();
-    const droppedFile = e.dataTransfer.files[0];
-    if (droppedFile && droppedFile.type === "video/mp4") {
-      setFile(droppedFile);
-    }
+    if (processing) return;
+    const droppedFiles = Array.from(e.dataTransfer.files).filter(
+      (f) => f.type === "video/mp4"
+    );
+    if (droppedFiles.length === 0) return;
+    const limitedFiles = droppedFiles.slice(0, MAX_FILES);
+    setFiles(
+      limitedFiles.map((file) => ({
+        file,
+        progress: 0,
+        status: "pending", // pending | processing | done | error
+        optimizedPath: null,
+        error: null,
+      }))
+    );
   };
 
   const handleDragOver = (e) => {
     e.preventDefault();
   };
 
-  const handleProcess = () => {
-    if (!file) return;
-
-    setProcessing(true);
-    setProgress(0);
-    const outputName = file.path.replace(".mp4", "-optimized.mp4");
-
-    ipcRenderer.send("optimize-video", {
-      inputPath: file.path,
-      outputName,
-      sendToTelegram,
-    });
-
-    ipcRenderer.on("optimization-progress", (_, { percent }) => {
-      setProgress(percent);
-    });
-
-    ipcRenderer.once(
-      "optimization-complete",
-      (_, { success, error, telegramSent, telegramError, filesDeleted }) => {
-        setProcessing(false);
-        setProgress(0);
-
-        if (success) {
-          if (filesDeleted) {
-            // If files were deleted after Telegram send, reset the UI
-            setFile(null);
-            setOptimizedFile(null);
-          } else if (!sendToTelegram) {
-            // If we're not sending to Telegram, show the optimized file
-            setOptimizedFile(outputName);
-          }
-        } else {
-          setFile(null);
+  // Register IPC listeners once on mount
+  useEffect(() => {
+    const progressListener = (_, { percent, index }) => {
+      setFiles((prev) => {
+        const updated = [...prev];
+        if (
+          updated[index] &&
+          updated[index].status !== "done" &&
+          updated[index].status !== "error"
+        ) {
+          updated[index] = { ...updated[index], progress: percent };
         }
-      }
-    );
-  };
+        return updated;
+      });
+    };
+    const completeListener = (_, { success, error, index }) => {
+      setFiles((prev) => {
+        const updated = [...prev];
+        if (!updated[index]) return updated;
+        if (success) {
+          updated[index] = {
+            ...updated[index],
+            status: "done",
+            progress: 100,
+            optimizedPath: updated[index].file.path.replace(
+              /\.mp4$/i,
+              "-optimized.mp4"
+            ),
+          };
+        } else {
+          updated[index] = {
+            ...updated[index],
+            status: "error",
+            error: error || "Unknown error",
+          };
+        }
+        // If all files are done or errored, stop processing
+        if (updated.every((f) => f.status === "done" || f.status === "error")) {
+          setProcessing(false);
+        }
+        return updated;
+      });
+    };
+    ipcRenderer.on("optimization-progress", progressListener);
+    ipcRenderer.on("optimization-complete", completeListener);
+    return () => {
+      ipcRenderer.removeListener("optimization-progress", progressListener);
+      ipcRenderer.removeListener("optimization-complete", completeListener);
+    };
+  }, []);
 
-  const handleOpenFile = () => {
-    if (optimizedFile) {
-      ipcRenderer.send("open-file", optimizedFile);
-      setFile(null);
-      setOptimizedFile(null);
+  // Sequentially process files
+  useEffect(() => {
+    if (files.length === 0 || processing) return;
+    setProcessing(true);
+    // Send all files at once for sequential processing in main process
+    const payload = files.map((f) => ({
+      inputPath: f.file.path,
+      outputName: f.file.path.replace(/\.mp4$/i, "-optimized.mp4"),
+      sendToTelegram: false,
+    }));
+    ipcRenderer.send("optimize-video", payload);
+    // eslint-disable-next-line
+  }, [files]);
+
+  const handleOpenFile = (optimizedPath) => {
+    if (optimizedPath && fs.existsSync(optimizedPath)) {
+      ipcRenderer.send("open-file", optimizedPath);
     }
   };
 
+  const handleReset = () => {
+    setFiles([]);
+    setProcessing(false);
+  };
+
   return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-800 to-gray-900 p-8 flex items-center justify-center">
-      <div className="w-[600px] mx-auto bg-white rounded-xl shadow-2xl overflow-hidden">
-        <div className="p-8">
-          <h1 className="text-3xl font-bold text-gray-800 mb-8 text-center">
+    <div className="min-h-screen bg-gradient-to-b from-gray-800 to-gray-900 p-2 flex items-center justify-center">
+      <div className="w-[480px] mx-auto bg-white rounded-xl shadow-2xl overflow-hidden">
+        <div className="p-4">
+          <h1 className="text-2xl font-bold text-gray-800 mb-4 text-center">
             Video Optimizer
           </h1>
-
-          <div className="mb-6">
-            <div className="flex items-center space-x-2">
-              <input
-                type="checkbox"
-                id="sendToTelegram"
-                checked={sendToTelegram}
-                onChange={(e) => setSendToTelegram(e.target.checked)}
-                className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
-              />
-              <label
-                htmlFor="sendToTelegram"
-                className="text-sm font-medium text-gray-700"
-              >
-                Send to Telegram after optimization
-              </label>
-            </div>
-          </div>
-
           <div
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             className={`
-              border-3 border-dashed rounded-lg p-12
+              border-2 border-dashed rounded-lg p-4
               text-center transition-all duration-200
               ${
-                file
+                files.length > 0
                   ? "border-green-400 bg-green-50"
                   : "border-gray-300 hover:border-blue-500 bg-gray-50"
               }
+              ${processing ? "opacity-60 pointer-events-none" : ""}
             `}
           >
-            {file ? (
-              <div className="space-y-4">
-                <p className="text-gray-700">
-                  Selected file:{" "}
-                  <span className="font-medium">{file.name}</span>
+            {files.length === 0 ? (
+              <div className="space-y-1">
+                <div className="text-3xl mb-2">📁</div>
+                <p className="text-gray-600 text-sm">
+                  Drag and drop up to 10 MP4 files here
                 </p>
-                {processing && (
-                  <div className="space-y-2">
-                    <div className="w-full bg-gray-200 rounded-full h-2.5">
-                      <div
-                        className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
-                        style={{ width: `${progress}%` }}
-                      ></div>
-                    </div>
-                    <div className="text-sm text-gray-600">
-                      {progress.toFixed(1)}% complete
-                    </div>
-                  </div>
-                )}
-                <div className="space-y-4">
-                  {optimizedFile ? (
-                    <button
-                      onClick={handleOpenFile}
-                      className="px-6 py-3 rounded-lg text-white font-medium bg-green-500 hover:bg-green-600 transition-colors duration-200"
-                    >
-                      Open optimized video
-                    </button>
-                  ) : (
-                    <button
-                      onClick={handleProcess}
-                      disabled={processing}
-                      className={`
-                        px-6 py-3 rounded-lg text-white font-medium
-                        transition-colors duration-200
-                        ${
-                          processing
-                            ? "bg-gray-400 cursor-not-allowed"
-                            : "bg-blue-500 hover:bg-blue-600"
-                        }
-                      `}
-                    >
-                      {processing ? "Processing..." : "Process Video"}
-                    </button>
-                  )}
-                </div>
               </div>
             ) : (
               <div className="space-y-2">
-                <div className="text-5xl mb-4">📁</div>
-                <p className="text-gray-600">Drag and drop an MP4 file here</p>
+                <ul className="space-y-2">
+                  {files.map((f, idx) => (
+                    <li
+                      key={f.file.path}
+                      className="bg-gray-100 rounded p-2 flex flex-col"
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="font-medium text-gray-800 text-xs truncate max-w-[260px]">
+                          {f.file.name}
+                        </span>
+                        <span className="text-xs text-gray-500">
+                          {f.status === "pending" && "Pending"}
+                          {f.status === "processing" && "Processing..."}
+                          {f.status === "done" && "Done"}
+                          {f.status === "error" && (
+                            <span className="text-red-500">Error</span>
+                          )}
+                        </span>
+                      </div>
+                      <div className="w-full bg-gray-200 rounded-full h-1 mb-1">
+                        <div
+                          className={`h-1 rounded-full transition-all duration-300 ${
+                            f.status === "error"
+                              ? "bg-red-400"
+                              : f.status === "done"
+                              ? "bg-green-500"
+                              : "bg-blue-600"
+                          }`}
+                          style={{ width: `${f.progress || 0}%` }}
+                        ></div>
+                      </div>
+                      {f.status === "error" && (
+                        <div className="text-xs text-red-500 mb-1">
+                          {f.error}
+                        </div>
+                      )}
+                      {f.status === "done" && f.optimizedPath && (
+                        <button
+                          onClick={() => handleOpenFile(f.optimizedPath)}
+                          className="px-2 py-1 rounded text-white font-medium bg-green-500 hover:bg-green-600 transition-colors duration-200 text-xs mt-1"
+                          disabled={!fs.existsSync(f.optimizedPath)}
+                        >
+                          Open
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+                <button
+                  onClick={handleReset}
+                  disabled={processing}
+                  className="mt-2 px-4 py-1 rounded-lg text-white font-medium bg-gray-400 hover:bg-gray-500 transition-colors duration-200 text-xs"
+                >
+                  Reset
+                </button>
               </div>
             )}
           </div>
